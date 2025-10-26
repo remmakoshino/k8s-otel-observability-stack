@@ -1,0 +1,3 @@
+# Backend Go dependencies
+# Run 'go mod tidy' to generate go.sum with correct checksums
+# This is a placeholder - actual go.sum will be generated when building the app

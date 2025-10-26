@@ -1,0 +1,18 @@
+apiVersion: v2
+name: observability-stack
+description: A Helm chart for Kubernetes Observability Stack with OpenTelemetry
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - observability
+  - opentelemetry
+  - prometheus
+  - grafana
+  - jaeger
+  - monitoring
+maintainers:
+  - name: remmakoshino
+home: https://github.com/remmakoshino/k8s-otel-observability-stack
+sources:
+  - https://github.com/remmakoshino/k8s-otel-observability-stack

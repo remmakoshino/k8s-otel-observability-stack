@@ -1,0 +1,252 @@
+name: Deploy
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository }}
+
+jobs:
+  build-images:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        app: [backend, frontend]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.app }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./apps/${{ matrix.app }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+  test-images:
+    name: Test Docker Images
+    runs-on: ubuntu-latest
+    needs: build-images
+    strategy:
+      matrix:
+        app: [backend, frontend]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: vars
+        run: echo "IMAGE_TAG=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.app }}:${{ github.ref_name }}-${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Test image
+        run: |
+          docker pull ${{ steps.vars.outputs.IMAGE_TAG }}
+          docker run --rm -d --name test-${{ matrix.app }} ${{ steps.vars.outputs.IMAGE_TAG }}
+          sleep 5
+          docker logs test-${{ matrix.app }}
+          docker stop test-${{ matrix.app }}
+
+  deploy-to-k8s:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: test-images
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: ${{ github.event.inputs.environment || 'development' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'v3.13.0'
+
+      # Note: 本番環境ではクラウドプロバイダーの認証を追加
+      # - name: Configure Kubeconfig
+      #   run: |
+      #     echo "${{ secrets.KUBECONFIG }}" | base64 -d > kubeconfig
+      #     export KUBECONFIG=./kubeconfig
+
+      - name: Update image tags
+        run: |
+          export IMAGE_TAG=${{ github.ref_name }}-${{ github.sha }}
+          
+          # Backend
+          sed -i "s|image: backend:latest|image: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/backend:${IMAGE_TAG}|g" \
+            kubernetes/sample-apps/backend/deployment.yaml
+          
+          # Frontend
+          sed -i "s|image: frontend:latest|image: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/frontend:${IMAGE_TAG}|g" \
+            kubernetes/sample-apps/frontend/deployment.yaml
+
+      - name: Deploy Observability Stack
+        run: |
+          # Namespace作成
+          kubectl apply -f kubernetes/namespaces/observability.yaml
+          
+          # OTel Collector
+          kubectl apply -f kubernetes/otel-collector/
+          
+          # Prometheus
+          kubectl apply -f kubernetes/prometheus/
+          
+          # Jaeger
+          kubectl apply -f kubernetes/jaeger/
+          
+          # Grafana
+          kubectl apply -f kubernetes/grafana/
+          
+          # Wait for observability stack
+          kubectl wait --for=condition=ready pod -n observability -l app=otel-collector --timeout=300s
+          kubectl wait --for=condition=ready pod -n observability -l app=prometheus --timeout=300s
+          kubectl wait --for=condition=ready pod -n observability -l app=jaeger --timeout=300s
+          kubectl wait --for=condition=ready pod -n observability -l app=grafana --timeout=300s
+
+      - name: Deploy Applications
+        run: |
+          # Backend
+          kubectl apply -f kubernetes/sample-apps/backend/
+          
+          # Frontend
+          kubectl apply -f kubernetes/sample-apps/frontend/
+          
+          # Wait for applications
+          kubectl wait --for=condition=ready pod -l app=backend --timeout=300s
+          kubectl wait --for=condition=ready pod -l app=frontend --timeout=300s
+
+      - name: Verify Deployment
+        run: |
+          echo "=== Observability Stack ==="
+          kubectl get pods -n observability
+          
+          echo "=== Applications ==="
+          kubectl get pods -l tier=application
+          
+          echo "=== Services ==="
+          kubectl get svc -n observability
+          kubectl get svc -l tier=application
+
+      - name: Run Smoke Tests
+        run: |
+          # Port-forward for testing
+          kubectl port-forward -n observability svc/prometheus 9090:9090 &
+          kubectl port-forward -n observability svc/grafana 3000:3000 &
+          kubectl port-forward svc/frontend 8080:8080 &
+          
+          sleep 10
+          
+          # Test Prometheus
+          curl -f http://localhost:9090/-/healthy || exit 1
+          
+          # Test Grafana
+          curl -f http://localhost:3000/api/health || exit 1
+          
+          # Test Frontend
+          curl -f http://localhost:8080/health || exit 1
+          
+          echo "All smoke tests passed!"
+
+  deploy-with-helm:
+    name: Deploy with Helm
+    runs-on: ubuntu-latest
+    needs: test-images
+    if: github.event.inputs.environment == 'production'
+    environment:
+      name: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'v3.13.0'
+
+      # - name: Configure Kubeconfig
+      #   run: |
+      #     echo "${{ secrets.KUBECONFIG }}" | base64 -d > kubeconfig
+      #     export KUBECONFIG=./kubeconfig
+
+      - name: Deploy with Helm
+        run: |
+          helm upgrade --install observability-stack ./helm/observability-stack \
+            --namespace observability \
+            --create-namespace \
+            --set backend.image.tag=${{ github.ref_name }}-${{ github.sha }} \
+            --set frontend.image.tag=${{ github.ref_name }}-${{ github.sha }} \
+            --wait \
+            --timeout 10m
+
+      - name: Verify Helm Deployment
+        run: |
+          helm list -n observability
+          helm status observability-stack -n observability
+
+  notify:
+    name: Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [deploy-to-k8s]
+    if: always()
+    steps:
+      - name: Notify Success
+        if: needs.deploy-to-k8s.result == 'success'
+        run: |
+          echo "Deployment successful!"
+          # Slack/Discord通知などを追加可能
+          
+      - name: Notify Failure
+        if: needs.deploy-to-k8s.result == 'failure'
+        run: |
+          echo "Deployment failed!"
+          # Slack/Discord通知などを追加可能
