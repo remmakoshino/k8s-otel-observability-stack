@@ -31,7 +31,7 @@ echo ""
 echo "Starting Minikube..."
 minikube start \
   --cpus=2 \
-  --memory=4096 \
+  --memory=8192 \
   --disk-size=20g \
   --driver=docker \
   --kubernetes-version=v1.28.0 \
